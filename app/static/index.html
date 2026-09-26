@@ -75,7 +75,9 @@
         <button id="btnSaveB" class="btn btn-sm" type="button">存为样本 B</button>
       </div>
     </div>
-    <div class="hint tree-hint">直接修改头部、正文、boundary、preamble/epilogue；multipart 可增删部分。未改动的部分按原字节还原。</div>
+    <div class="hint tree-hint">直接修改头部、正文、boundary、preamble/epilogue；multipart 可增删部分。
+      声明了 Content-Transfer-Encoding（base64 / quoted-printable）的部分已解码为可编辑内容，
+      可用「传输编码」下拉切换编码方式。未改动的部分按原字节还原。</div>
     <div id="treeRoot"></div>
 
     <div class="encode-bar">

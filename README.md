@@ -12,6 +12,11 @@
   缺关闭定界符、报文截断等；
 - 📝 **引号参数**：正确解析 Content-Type 中带引号的 `boundary` 参数、
   分号与反斜杠转义（如 `boundary="a;b"`、`charset="utf\"-8"`）；
+- 🔡 **Content-Transfer-Encoding**：识别叶子部分的 `base64` /
+  `quoted-printable` / `7bit` / `8bit` / `binary`，把传输正文解码为
+  可编辑内容并保留原始编码信息；畸形编码产生带节点路径的诊断且
+  不丢失原始载荷；重新编码按头部声明回写并遵守 MIME 折行规则
+  （base64 76 列、quoted-printable 76 列软换行），未编辑节点逐字节还原；
 - 🩺 **诊断面板**：按 *错误 / 警告 / 提示* 三级列出每个解析问题及所属部分路径；
 - ✏️ **可视化编辑**：逐层展开/折叠，编辑任意部分的头部、正文、boundary、
   preamble / epilogue，可新增或删除部分；
@@ -71,7 +76,10 @@ http://localhost:8000/docs 。
    - **原始报文**：完整 MIME 报文或 multipart body 均可，支持 CRLF / LF。
 2. 点击 **解析报文**，查看诊断信息与树形结构。
 3. 展开任意 multipart 节点，修改 boundary、头部、正文、preamble/epilogue，
-   或增删子部分。
+   或增删子部分。声明了 `Content-Transfer-Encoding: base64` /
+   `quoted-printable` 的叶子部分会显示**已解码**的正文，可直接编辑；
+   也可用节点内的「传输编码」下拉把该部分**切换为 base64 /
+   quoted-printable**（即改写其 CTE 头部），随后重新编码下载即按新编码输出。
 4. 勾选/取消“编码时包含顶层头部”，点击 **重新编码并下载**。
 5. 在结果区可重新下载、复制为文本，或查看编码后的完整报文。
 6. **样本对比**（页面底部「4. 样本对比」卡片）：
@@ -83,7 +91,33 @@ http://localhost:8000/docs 。
    - 点击 **导出 JSON 差异报告** 下载 `mime-diff-report.json`。
 
 > 不是合法 UTF-8 的正文（如二进制附件）会以 **base64** 呈现；只要不修改，
-> 重新编码时会逐字节还原。
+> 重新编码时会逐字节还原。对声明了 base64 / quoted-printable 传输编码的
+> 部分，编辑器展示的是**解码后**的内容；未编辑时重新编码回写**原始载荷**
+> （含原始折行），保证字节稳定。
+
+---
+
+## Content-Transfer-Encoding 语义
+
+叶子部分（`kind: "part"`）按 RFC 2045 §6 处理 `Content-Transfer-Encoding`：
+
+| 声明值 | 解析行为 | 重新编码行为 |
+| --- | --- | --- |
+| `base64` | 忽略载荷中的折行空白后解码；非法字符 / 错误 padding 记 `CTE_BASE64_INVALID`（错误），正文区展示**原始载荷** | 未编辑时回写原始载荷（含原始折行）；编辑后按 76 列 CRLF 折行重新编码 |
+| `quoted-printable` | 解码 `=XX` 与软换行 `=CRLF`；畸形 `=` 序列记 `CTE_QP_INVALID`（警告）并按原样保留 | 未编辑时回写原始载荷；编辑后按 RFC 2045 §6.7 重新编码（行尾空白编码为 `=20`/`=09`，76 列软换行） |
+| `7bit` / `8bit` | 不解码；含高位 / NUL 字节记 `CTE_7BIT_VIOLATION` / `CTE_8BIT_VIOLATION`（警告） | 原样输出 |
+| `binary` | 不解码、不校验 | 原样输出 |
+| 其他值 | 记 `CTE_UNKNOWN`（警告），按未编码（7bit 语义）处理 | 原样输出并再次给出 `CTE_UNKNOWN` |
+| 未声明 | 按 7bit 语义展示 | 原样输出 |
+
+补充规则：
+
+- `multipart/*` 节点声明 base64 / quoted-printable 会记 `CTE_ON_MULTIPART`
+  （警告，RFC 2045 §6.4）并忽略；
+- 编码方式以**节点当前的 CTE 头部**为准：直接编辑头部或用前端下拉切换
+  （base64 ↔ quoted-printable）都会按新声明回写；
+- 解析时解码失败的部分，正文即原始载荷，编码时原样回写绝不二次编码；
+  此时若变更了编码方式，记 `CTE_NOT_CONVERTED`（警告）。
 
 ---
 
@@ -109,6 +143,12 @@ http://localhost:8000/docs 。
 | `NO_LEADING_CRLF` | 提示 | 首定界符前无 CRLF（HTTP multipart 常见） |
 | `PREAMBLE` / `EPILOGUE` | 提示 | 存在序言 / 尾注，MIME 处理器应忽略 |
 | `BINARY_BODY` | 提示 | 该部分为非文本，已按 base64 呈现 |
+| `CTE_BASE64_INVALID` | 错误 | base64 载荷畸形（非法字符 / padding），已保留原始载荷 |
+| `CTE_UNKNOWN` | 警告 | 无法识别的 Content-Transfer-Encoding，按 7bit 语义处理 |
+| `CTE_QP_INVALID` | 警告 | quoted-printable 含畸形 `=` 序列，已按原样保留 |
+| `CTE_7BIT_VIOLATION` / `CTE_8BIT_VIOLATION` | 警告 | 声明 7bit/8bit 但正文含高位 / NUL 字节 |
+| `CTE_ON_MULTIPART` | 警告 | multipart 不允许 base64/QP 传输编码（RFC 2045 §6.4） |
+| `CTE_NOT_CONVERTED` | 警告 | （编码时）原始编码畸形，内容未随编码方式变更转换 |
 
 ---
 
@@ -151,11 +191,22 @@ http://localhost:8000/docs 。
       "headers": [],
       "hasHeaders": false,
       "body": "v",
-      "bodyEncoding": "utf-8"
+      "bodyEncoding": "utf-8",
+      "cte": null,
+      "cteDecoded": false
     } ]
   }
 }
 ```
+
+叶子部分（`kind: "part"`）与传输编码相关的字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `cte` | 归一化（小写）的 Content-Transfer-Encoding 声明值；未声明为 `null` |
+| `cteDecoded` | base64 / quoted-printable 是否解码成功；失败时 `body` 为原始载荷 |
+| `body` / `bodyEncoding` | 解码后的可编辑内容及其呈现编码（`utf-8` 或 `base64`） |
+| `cteRaw` / `cteRawEncoding` | 原始传输载荷（仅 base64/QP 部分返回）；未编辑时编码端逐字节回写 |
 
 ### `POST /api/encode`
 
@@ -177,6 +228,11 @@ http://localhost:8000/docs 。
   "issues": []
 }
 ```
+
+编码端按各叶子部分**当前的** `Content-Transfer-Encoding` 头部回写正文：
+`base64` 按 76 列折行、`quoted-printable` 按 76 列软换行；未编辑且编码
+方式未变的部分直接回写原始载荷（字节稳定）；修改或删除该头部即切换
+编码方式（例如把 `base64` 改为 `quoted-printable` 即完成转码）。
 
 ### `POST /api/diff`
 
@@ -273,8 +329,9 @@ python3 tests/smoke_test.py
 
 覆盖：基本 form-data、CJK、嵌套 multipart、preamble/epilogue、
 引号与转义参数、boundary 覆盖、定界符碰撞、缺关闭定界符、LF 规范化、
-二进制逐字节往返、编辑后重新编码，以及样本对比（节点增删折叠、
-字段级差异、头部逐行对比、诊断代码归属与全局诊断）。
+二进制逐字节往返、编辑后重新编码、Content-Transfer-Encoding
+（base64/QP 解码与折行回写、畸形编码诊断与原始载荷保留、编码方式切换），
+以及样本对比（节点增删折叠、字段级差异、头部逐行对比、诊断代码归属与全局诊断）。
 
 ---
 

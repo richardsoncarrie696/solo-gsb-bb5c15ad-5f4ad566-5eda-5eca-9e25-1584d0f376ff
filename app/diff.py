@@ -173,6 +173,8 @@ def _compare_nodes(path, na, nb, buckets_a, buckets_b):
                 ("filename", "filename 参数"),
                 ("body", "正文"),
                 ("bodyEncoding", "正文编码"),
+                ("cte", "传输编码"),
+                ("cteDecoded", "传输解码状态"),
                 ("hasHeaders", "含头部块"),
             ):
                 f = _scalar_field(key, label, na.get(key), nb.get(key))

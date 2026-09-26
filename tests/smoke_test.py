@@ -304,5 +304,148 @@ check("自比无差异", d6["summary"]["modified"] == 0
       d6["summary"])
 check("自比全部 unchanged", d6["summary"]["unchanged"] == len(d6["entries"]))
 
+# 12. Content-Transfer-Encoding：base64 / quoted-printable ------------------
+print("12) Content-Transfer-Encoding 语义")
+
+# 12a. base64 解码为可编辑内容；非规范折行的原始载荷未编辑时逐字节保留
+b64 = base64.b64encode("你好，base64！".encode()).decode()
+raw12 = ("Content-Type: multipart/mixed; boundary=E1\r\n\r\n"
+         "--E1\r\nContent-Type: text/plain; charset=utf-8\r\n"
+         "Content-Transfer-Encoding: base64\r\n\r\n"
+         + b64[:8] + "\r\n" + b64[8:] + "\r\n--E1--").encode()
+r12, enc12, out12 = roundtrip(raw12)
+p12 = r12["tree"]["parts"][0]
+check("识别 base64 CTE", p12["cte"] == "base64")
+check("base64 解码成功", p12["cteDecoded"] is True)
+check("解码为可编辑文本", p12["body"] == "你好，base64！", repr(p12["body"]))
+check("保存原始载荷", base64.b64decode(
+    p12["cteRaw"]) == (b64[:8] + "\r\n" + b64[8:]).encode()
+    if p12["cteRawEncoding"] == "base64"
+    else p12["cteRaw"] == b64[:8] + "\r\n" + b64[8:])
+check("未编辑字节稳定（保留原始折行）", out12 == raw12,
+      f"\n{out12!r}\n!=\n{raw12!r}")
+
+# 12b. 编辑后重新编码：base64 按 76 列折行且可解码回新内容
+r12b = mime.parse_message(raw12.decode(), None, None)
+r12b["tree"]["parts"][0]["body"] = "长内容" * 100
+out12b = base64.b64decode(
+    mime.encode_tree(r12b["tree"], True)["payloadBase64"])
+seg = out12b.split(b"--E1\r\n", 1)[1].rsplit(b"\r\n--E1--", 1)[0]
+payload = seg.split(b"\r\n\r\n", 1)[1]
+lines = payload.split(b"\r\n")
+check("base64 重新编码折行 <= 76", all(len(l) <= 76 for l in lines),
+      [len(l) for l in lines])
+check("base64 折行为 76 列", len(lines[0]) == 76)
+check("base64 重新编码内容正确",
+      base64.b64decode(b"".join(lines)) == "长内容".encode() * 100)
+
+# 12c. quoted-printable 解码与字节稳定
+raw12c = (b"--E\r\nContent-Type: text/plain\r\n"
+          b"Content-Transfer-Encoding: quoted-printable\r\n\r\n"
+          b"caf=C3=A9 =3D ok=20\r\n--E--")
+r12c = mime.parse_message(raw12c.decode(), "multipart/mixed", "E")
+p12c = r12c["tree"]["parts"][0]
+check("识别 QP CTE", p12c["cte"] == "quoted-printable")
+check("QP 解码为文本", p12c["cteDecoded"] is True
+      and p12c["body"] == "café = ok ", repr(p12c["body"]))
+out12c = base64.b64decode(
+    mime.encode_tree(r12c["tree"], False)["payloadBase64"])
+check("QP 未编辑字节稳定", out12c == raw12c, f"\n{out12c!r}\n!=\n{raw12c!r}")
+
+# 12d. QP 重新编码：76 列软换行、行尾空白编码、往返一致
+src = ("A" * 200 + "  \n" + "中文 = 测试").encode()
+enc_qp = mime._encode_qp_transport(src)
+dec_qp, bad_qp = mime._decode_qp_transport(enc_qp)
+check("QP 编码每行 <= 76", all(len(l) <= 76 for l in enc_qp.split(b"\r\n")))
+check("QP 行尾空白被编码", b"=20=20\r\n" in enc_qp, enc_qp[-60:])
+check("QP 编码往返一致", dec_qp == src.replace(b"\n", b"\r\n") and bad_qp == 0)
+
+# 12e. 畸形 base64：带节点路径的诊断 + 原始载荷不丢失 + 字节稳定
+raw12e = (b"Content-Type: multipart/mixed; boundary=O\r\n\r\n"
+          b"--O\r\nContent-Type: text/plain\r\n\r\nkeep\r\n"
+          b"--O\r\nContent-Type: multipart/mixed; boundary=I\r\n\r\n"
+          b"--I\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+          b"SGVsbG8@###==\r\n--I--\r\n--O--")
+r12e = mime.parse_message(raw12e.decode(), None, None)
+bad_issues = [i for i in r12e["issues"] if i["code"] == "CTE_BASE64_INVALID"]
+check("畸形 base64 产生诊断", len(bad_issues) == 1, r12e["issues"])
+check("诊断带节点路径", bad_issues
+      and bad_issues[0]["message"].startswith("parts[1].parts[0]："),
+      bad_issues)
+p12e = r12e["tree"]["parts"][1]["parts"][0]
+check("畸形 base64 未标记解码", p12e["cteDecoded"] is False)
+check("畸形 base64 正文即原始载荷", p12e["body"] == "SGVsbG8@###==")
+out12e = base64.b64decode(
+    mime.encode_tree(r12e["tree"], True)["payloadBase64"])
+check("畸形 base64 字节稳定", out12e == raw12e,
+      f"\n{out12e!r}\n!=\n{raw12e!r}")
+
+# 12f. 畸形 QP：warning + 畸形序列保留
+raw12f = (b"--E\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n"
+          b"abc=XY=Zdef\r\n--E--")
+r12f = mime.parse_message(raw12f.decode(), "multipart/mixed", "E")
+p12f = r12f["tree"]["parts"][0]
+check("畸形 QP 产生 warning 诊断",
+      any(i["code"] == "CTE_QP_INVALID" and i["level"] == "warning"
+          and i["message"].startswith("parts[0]：") for i in r12f["issues"]),
+      r12f["issues"])
+check("畸形 QP 序列保留", p12f["body"] == "abc=XY=Zdef", repr(p12f["body"]))
+
+# 12g. 未知 CTE / 7bit 违规 / multipart 上的编码
+raw12g = (b"--E\r\nContent-Transfer-Encoding: x-uue\r\n\r\nbegin 644 x\r\n--E--")
+r12g = mime.parse_message(raw12g.decode(), "multipart/mixed", "E")
+check("未知 CTE 诊断", any(i["code"] == "CTE_UNKNOWN" for i in r12g["issues"]))
+check("未知 CTE 按未编码处理", r12g["tree"]["parts"][0]["body"] == "begin 644 x")
+out12g = base64.b64decode(
+    mime.encode_tree(r12g["tree"], False)["payloadBase64"])
+check("未知 CTE 字节稳定", out12g == raw12g)
+
+raw12h = (b"--E\r\nContent-Transfer-Encoding: 7bit\r\n\r\ncaf\xc3\xa9\r\n--E--")
+r12h = mime.parse_message(raw12h.decode(), "multipart/mixed", "E")
+check("7bit 高位字节诊断",
+      any(i["code"] == "CTE_7BIT_VIOLATION" for i in r12h["issues"]))
+
+raw12i = (b"--E\r\nContent-Type: multipart/mixed; boundary=I\r\n"
+          b"Content-Transfer-Encoding: base64\r\n\r\n"
+          b"--I\r\n\r\nx\r\n--I--\r\n--E--")
+r12i = mime.parse_message(raw12i.decode(), "multipart/mixed", "E")
+check("multipart 上的 base64 诊断",
+      any(i["code"] == "CTE_ON_MULTIPART" for i in r12i["issues"]))
+
+# 12j. 切换编码方式（模拟前端下拉：改头部后按新声明回写）
+r12j = mime.parse_message(raw12.decode(), None, None)
+hdr = next(h for h in r12j["tree"]["parts"][0]["headers"]
+           if h["name"].lower() == "content-transfer-encoding")
+hdr["value"] = "quoted-printable"
+out12j = base64.b64decode(
+    mime.encode_tree(r12j["tree"], True)["payloadBase64"])
+seg = out12j.split(b"--E1\r\n", 1)[1].rsplit(b"\r\n--E1--", 1)[0]
+payload = seg.split(b"\r\n\r\n", 1)[1]
+check("切换为 QP 后按 QP 回写",
+      mime._decode_qp_transport(payload)[0] == "你好，base64！".encode(),
+      payload)
+check("QP 回写不含裸高位字节", all(b < 0x80 for b in payload))
+
+# 反向：QP -> base64
+r12k = mime.parse_message(raw12c.decode(), "multipart/mixed", "E")
+hdr = next(h for h in r12k["tree"]["parts"][0]["headers"]
+           if h["name"].lower() == "content-transfer-encoding")
+hdr["value"] = "base64"
+out12k = base64.b64decode(
+    mime.encode_tree(r12k["tree"], False)["payloadBase64"])
+seg = out12k.split(b"--E\r\n", 1)[1].rsplit(b"\r\n--E--", 1)[0]
+payload = seg.split(b"\r\n\r\n", 1)[1]
+check("切换为 base64 后按 base64 回写",
+      base64.b64decode(payload) == "café = ok ".encode(), payload)
+
+# 12k. diff 覆盖 CTE 字段
+sa12 = mime.parse_message(raw12.decode(), None, None)
+sb12 = mime.parse_message(raw12c.decode(), "multipart/mixed", "E")
+d12 = diff.diff_results({"tree": sa12["tree"], "issues": sa12["issues"]},
+                        {"tree": sb12["tree"], "issues": sb12["issues"]})
+by_path12 = {e["path"]: e for e in d12["entries"]}
+p0_fields = {f["field"] for f in by_path12["parts[0]"]["fields"]}
+check("diff 检出传输编码差异", "cte" in p0_fields, p0_fields)
+
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

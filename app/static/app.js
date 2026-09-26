@@ -57,15 +57,16 @@ const SAMPLE_NESTED =
   'plain 版本\r\n' +
   '--INNER-42\r\n' +
   'Content-Type: text/html; charset=utf-8\r\n' +
+  'Content-Transfer-Encoding: quoted-printable\r\n' +
   '\r\n' +
-  '<p><b>HTML</b> 版本</p>\r\n' +
+  '<p><b>HTML</b> =E7=89=88=E6=9C=AC</p>\r\n' +
   '--INNER-42--\r\n' +
   '--OUTER-001\r\n' +
   'Content-Disposition: attachment; filename="report.csv"\r\n' +
   'Content-Type: text/csv\r\n' +
+  'Content-Transfer-Encoding: base64\r\n' +
   '\r\n' +
-  'id,name\r\n' +
-  '1,张三\r\n' +
+  'aWQsbmFtZQ0KMSzlvKDkuIkNCg==\r\n' +
   '--OUTER-001--\r\n' +
   'epilogue text, must be ignored';
 
@@ -220,9 +221,15 @@ function renderNode(node, depth) {
 
   const bar = document.createElement("div");
   bar.className = "node-bar";
+  const cteBad = !isMulti && node.cteDecoded === false &&
+    (node.cte === "base64" || node.cte === "quoted-printable");
+  const cteBadge = (!isMulti && node.cte)
+    ? `<span class="badge cte${cteBad ? " cte-bad" : ""}">CTE ${escapeHtml(node.cte)}</span>`
+    : "";
   bar.innerHTML =
     `<span class="caret">▼</span>` +
     `<span class="badge ${isMulti ? "multipart" : ""}">${escapeHtml(node.mediaType || (isMulti ? "multipart/*" : "application/octet-stream"))}</span>` +
+    cteBadge +
     `<span class="node-title">${escapeHtml(node.path)}${titleExtra}</span>` +
     `<span class="node-spacer"></span>` +
     `<span class="node-size">${humanSize(node.rawSize || 0)}</span>`;
@@ -307,8 +314,10 @@ function renderNode(node, depth) {
     const lab = document.createElement("label");
     const enc = node.bodyEncoding || "utf-8";
     const isBin = enc === "base64";
+    const cteInfo = describeCte(node);
     lab.innerHTML = `正文 <span class="meta-pill ${isBin ? "latin" : ""}">` +
-      `${isBin ? "二进制 · base64（未修改即逐字节还原）" : enc}</span>`;
+      `${isBin ? "二进制 · base64（未修改即逐字节还原）" : enc}</span> ` +
+      `<span class="meta-pill ${cteInfo.cls}">${escapeHtml(cteInfo.text)}</span>`;
     body.appendChild(lab);
     if (isBin) {
       const note = document.createElement("div");
@@ -322,6 +331,34 @@ function renderNode(node, depth) {
     ta.value = node.body || "";
     ta.addEventListener("input", () => { node.body = ta.value; });
     body.appendChild(ta);
+
+    // 传输编码转换：下拉即修改/移除 Content-Transfer-Encoding 头，
+    // 重新编码时按新声明回写（base64 76 列折行、QP 软换行），随后可下载。
+    const cteRow = document.createElement("div");
+    cteRow.className = "inline-row cte-row";
+    cteRow.innerHTML =
+      `<label>传输编码</label>` +
+      `<select class="cte-select">` +
+      `<option value="">保持声明（${escapeHtml(node.cte || "未声明")}）</option>` +
+      `<option value="base64">转为 base64</option>` +
+      `<option value="quoted-printable">转为 quoted-printable</option>` +
+      `</select>` +
+      `<span class="hint">切换后点「重新编码并下载」生效</span>`;
+    const sel = $("select", cteRow);
+    // 头部当前值与解析时的声明不一致（已被切换）时，选中对应的转换项；
+    // 否则停留在“保持声明”。
+    const curCte = currentCteHeader(node);
+    if (curCte !== (node.cte || null) &&
+        (curCte === "base64" || curCte === "quoted-printable")) {
+      sel.value = curCte;
+    }
+    sel.addEventListener("click", (e) => e.stopPropagation());
+    sel.addEventListener("change", () => {
+      // 选“保持声明”时恢复解析时的原始声明（原本无声明则移除该头）
+      setCteHeader(node, sel.value === "" ? node.cte : sel.value);
+      rerenderTree();
+    });
+    body.appendChild(cteRow);
   }
 
   // 删除按钮（根节点不显示）
@@ -355,6 +392,45 @@ function findParent(root, target) {
     if (found) return found;
   }
   return null;
+}
+
+// ------------------------------------------------------- CTE（传输编码） --
+
+// 节点当前的 Content-Transfer-Encoding 头值（小写）；未声明返回 null
+function currentCteHeader(node) {
+  const h = (node.headers || []).find(
+    (x) => (x.name || "").trim().toLowerCase() === "content-transfer-encoding");
+  return h ? (h.value || "").trim().toLowerCase() : null;
+}
+
+// 写入/移除 CTE 头；value 为 null 时删除所有 CTE 头
+function setCteHeader(node, value) {
+  const idx = (node.headers || []).findIndex(
+    (x) => (x.name || "").trim().toLowerCase() === "content-transfer-encoding");
+  if (value == null) {
+    if (idx >= 0) node.headers.splice(idx, 1);
+    return;
+  }
+  if (idx >= 0) {
+    node.headers[idx].value = value;
+  } else {
+    node.headers.push({ name: "Content-Transfer-Encoding", value, raw: "" });
+  }
+}
+
+// 正文区的 CTE 状态说明（编码方式 + 解码状态）
+function describeCte(node) {
+  const cte = node.cte;
+  if (!cte) return { text: "CTE 未声明 · 按 7bit 处理", cls: "" };
+  if (cte === "base64" || cte === "quoted-printable") {
+    return node.cteDecoded
+      ? { text: `CTE: ${cte} · 已解码为可编辑内容`, cls: "cte-ok" }
+      : { text: `CTE: ${cte} · 解码失败，正文为原始载荷`, cls: "cte-bad" };
+  }
+  if (["7bit", "8bit", "binary"].includes(cte)) {
+    return { text: `CTE: ${cte}（无需解码）`, cls: "" };
+  }
+  return { text: `CTE: ${cte} · 未知编码，按 7bit 处理`, cls: "cte-bad" };
 }
 
 function rerenderTree() {
