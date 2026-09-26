@@ -12,7 +12,7 @@
     <span class="logo">▥</span>
     <div>
       <h1>MIME Multipart 报文检查器</h1>
-      <p class="sub">RFC 2046 · 嵌套 multipart · quoted 参数 · CRLF 边界 · 编辑后重新编码</p>
+      <p class="sub">RFC 2045/2046 · 嵌套 multipart · Content-Transfer-Encoding · quoted 参数 · CRLF 边界 · 编辑后重新编码</p>
     </div>
   </div>
   <div class="topbar-actions">
@@ -75,7 +75,7 @@
         <button id="btnSaveB" class="btn btn-sm" type="button">存为样本 B</button>
       </div>
     </div>
-    <div class="hint tree-hint">直接修改头部、正文、boundary、preamble/epilogue；multipart 可增删部分。未改动的部分按原字节还原。</div>
+    <div class="hint tree-hint">直接修改头部、正文、boundary、preamble/epilogue；叶子节点可切换 Content-Transfer-Encoding（base64 / quoted-printable 等）。未改动的节点按原字节还原。</div>
     <div id="treeRoot"></div>
 
     <div class="encode-bar">

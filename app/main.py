@@ -14,8 +14,9 @@ from .mime import encode_tree, parse_message
 
 app = FastAPI(
     title="MIME Multipart 报文检查器",
-    description="按 RFC 2046 解析嵌套 multipart，编辑后按原 boundary 规则重新编码。",
-    version="1.0.0",
+    description="按 RFC 2045/2046 解析嵌套 multipart 与 Content-Transfer-Encoding，"
+                "编辑后按原 boundary 规则与 CTE 折行重新编码。",
+    version="1.1.0",
 )
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -33,6 +34,9 @@ class ParseRequest(BaseModel):
 
 
 class EncodeRequest(BaseModel):
+    # tree 为 /api/parse 的结果；叶子节点的 transferEncoding 决定按
+    # base64/quoted-printable/7bit/8bit/binary 回写，bodyEdited 为真或
+    # CTE 切换时重新编码，否则回写 rawBodyBase64（未编辑字节稳定）。
     tree: dict
     include_headers: bool = Field(default=True, alias="includeHeaders")
     filename: str | None = None

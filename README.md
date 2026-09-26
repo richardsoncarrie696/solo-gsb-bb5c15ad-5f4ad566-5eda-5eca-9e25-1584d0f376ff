@@ -12,10 +12,16 @@
   缺关闭定界符、报文截断等；
 - 📝 **引号参数**：正确解析 Content-Type 中带引号的 `boundary` 参数、
   分号与反斜杠转义（如 `boundary="a;b"`、`charset="utf\"-8"`）；
+- 🔡 **Content-Transfer-Encoding 语义**：按 RFC 2045 识别叶子部分的
+  `base64`、`quoted-printable`、`7bit`、`8bit` 与 `binary`，把传输正文
+  **解码为可编辑内容**并保留原始编码信息；可在前端切换
+  base64 / quoted-printable 后重新编码下载（遵守 76 字符 MIME 折行）。
+  畸形编码产生**带节点路径**的诊断且不丢失原始载荷，未编辑节点逐字节稳定；
 - 🩺 **诊断面板**：按 *错误 / 警告 / 提示* 三级列出每个解析问题及所属部分路径；
 - ✏️ **可视化编辑**：逐层展开/折叠，编辑任意部分的头部、正文、boundary、
   preamble / epilogue，可新增或删除部分；
 - 🔁 **重新编码并下载**：按（可能已修改的）boundary 规则以 CRLF 重新生成报文，
+  按头部声明回写 Content-Transfer-Encoding（base64/QP 自动折行），
   可选择是否包含顶层头部；未修改的部分逐字节还原（含二进制）。
 - 🆚 **样本对比**：把两份解析结果存为样本 A / B（保存在浏览器 localStorage），
   按树路径对齐比较媒体类型、头部、正文编码、boundary、序言/尾注与诊断代码；
@@ -72,9 +78,19 @@ http://localhost:8000/docs 。
 2. 点击 **解析报文**，查看诊断信息与树形结构。
 3. 展开任意 multipart 节点，修改 boundary、头部、正文、preamble/epilogue，
    或增删子部分。
-4. 勾选/取消“编码时包含顶层头部”，点击 **重新编码并下载**。
-5. 在结果区可重新下载、复制为文本，或查看编码后的完整报文。
-6. **样本对比**（页面底部「4. 样本对比」卡片）：
+4. 在叶子节点上通过 **Content-Transfer-Encoding** 下拉框切换
+   `7bit / 8bit / binary / base64 / quoted-printable`：
+   - 解析时若头部声明为 `base64` 或 `quoted-printable`，正文框展示的是
+     **解码后内容**，可直接编辑；节点标题旁的 `CTE:` 徽章与下拉框右侧的
+     状态胶囊显示编码方式与解码状态（原始 / 解码成功 / 畸形 / 未知透传）；
+   - 切换编码或修改正文后，点击 **重新编码并下载**，后端按所选 CTE 回写
+     并遵守 MIME 折行规则（base64 与 quoted-printable 每行不超过 76 字符，
+     以 CRLF 折行），同时同步 Content-Transfer-Encoding 头部；
+   - **未编辑**的节点（含畸形 base64/QP）始终回写解析时保存的原始传输字节，
+     保证逐字节稳定；原始载荷保存在节点的 `rawBodyBase64` 字段中，不会丢失。
+5. 勾选/取消“编码时包含顶层头部”，点击 **重新编码并下载**。
+6. 在结果区可重新下载、复制为文本，或查看编码后的完整报文。
+7. **样本对比**（页面底部「4. 样本对比」卡片）：
    - 解析一份报文后点击结构区右上角的 **存为样本 A**；再解析（或编辑后重新解析）
      另一份报文，点击 **存为样本 B**。样本保存在浏览器 localStorage，刷新不丢失；
    - 点击 **开始对比**，查看按树路径对齐的差异清单（新增 / 删除 / 修改 / 未变化，
@@ -82,8 +98,11 @@ http://localhost:8000/docs 。
    - 点击条目右侧的 **A** / **B** 按钮，在下方对应的只读结构树中高亮定位该节点；
    - 点击 **导出 JSON 差异报告** 下载 `mime-diff-report.json`。
 
-> 不是合法 UTF-8 的正文（如二进制附件）会以 **base64** 呈现；只要不修改，
-> 重新编码时会逐字节还原。
+> 不是合法 UTF-8 的正文（如二进制附件）会以 **base64 编辑通道** 呈现；
+> 只要不修改，重新编码时会逐字节还原。注意区分两个层面的编码：
+> **Content-Transfer-Encoding**（MIME 传输编码，记录在
+> `transferEncoding` 字段）与**编辑通道**（`bodyEncoding`，仅表示
+> 前后端 JSON 中该正文以 utf-8 文本还是 base64 承载）。
 
 ---
 
@@ -109,6 +128,32 @@ http://localhost:8000/docs 。
 | `NO_LEADING_CRLF` | 提示 | 首定界符前无 CRLF（HTTP multipart 常见） |
 | `PREAMBLE` / `EPILOGUE` | 提示 | 存在序言 / 尾注，MIME 处理器应忽略 |
 | `BINARY_BODY` | 提示 | 该部分为非文本，已按 base64 呈现 |
+| `BAD_CTE_SYNTAX` | 警告 | Content-Transfer-Encoding 头不是单个合法 token（含多余参数），已原样透传 |
+| `UNKNOWN_TRANSFER_ENCODING` | 警告 | 未知/非标准 CTE（如 `x-uuencode`），正文按原始字节透传 |
+| `CTE_NOT_7BIT` / `CTE_BINARY_IN_8BIT` | 警告 | 声明 7bit 却含非 ASCII/控制字节，或 8bit 中混入 NUL 等 |
+| `CTE_BARE_NEWLINE` | 警告 | 7bit/8bit/QP 正文含孤立 CR/LF（RFC 要求 CRLF） |
+| `CTE_LONG_LINE` | 警告 | base64/QP 编码行超过 76 字符折行限制 |
+| `CTE_TRAILING_WSP` | 警告 | QP 硬换行前的空格/制表符未编码为 `=20`/`=09` |
+| `BAD_BASE64` | 警告 | base64 含非法字符/错误 padding，已剔除/补齐后尽力解码（状态 `malformed`） |
+| `BAD_QUOTED_PRINTABLE` | 警告 | QP 含非法 `=XX` 转义，已按字面保留（状态 `malformed`，载荷不丢） |
+| `BAD_CTE_ON_MULTIPART` | 警告 | multipart 实体只能使用 7bit/8bit/binary，已忽略该 CTE |
+| `CTE_HEADER_ADDED` | 提示 | 切换到 base64/QP 等编码时自动添加 Content-Transfer-Encoding 头 |
+
+### Content-Transfer-Encoding 语义（RFC 2045 §6）
+
+- **识别**：叶子部分的 `Content-Transfer-Encoding` 头（不区分大小写）
+  支持 `7bit`、`8bit`、`binary`、`base64`、`quoted-printable`；缺省视为 `7bit`。
+  值非法或未知时记录诊断并**原样透传**，不做破坏性转换。
+- **解码**：`base64` / `quoted-printable` 正文被解码为编辑内容
+  （再按是否合法 UTF-8 决定编辑通道 `bodyEncoding`）。畸形数据尽力恢复，
+  诊断消息带节点路径（如 `parts[1].parts[0]：base64 正文含非法字符…`），
+  节点 `decodeState` 标为 `malformed`；原始传输体始终保留在 `rawBodyBase64`。
+- **重新编码**：按节点的 `transferEncoding`（即头部声明）回写：
+  base64 与 quoted-printable 自动按 **76 字符** 折行（CRLF），
+  QP 中 `=`、非 ASCII、控制字节转义为 `=XX`，硬换行前的 WSP 编码为
+  `=20`/`=09`，孤立 CR/LF 转义以避免裸换行；同时同步头部。
+- **字节稳定**：未编辑（`bodyEdited` 非真、CTE 未切换）的节点直接回写
+  `rawBodyBase64` 保存的原始传输体，即使原始编码畸形也逐字节还原。
 
 ---
 
@@ -151,7 +196,11 @@ http://localhost:8000/docs 。
       "headers": [],
       "hasHeaders": false,
       "body": "v",
-      "bodyEncoding": "utf-8"
+      "bodyEncoding": "utf-8",
+      "transferEncoding": "7bit",
+      "transferEncodingDeclared": "7bit",
+      "decodeState": "raw",
+      "rawBodyBase64": "dg=="
     } ]
   }
 }
@@ -165,7 +214,19 @@ http://localhost:8000/docs 。
 { "tree": { /* /api/parse 返回的 tree，可修改 */ }, "includeHeaders": true }
 ```
 
-响应：
+响应（叶子节点 CTE 字段说明）：
+
+叶子节点与 Content-Transfer-Encoding 相关的字段（`/api/parse` 返回，
+可在 tree 中修改后回传 `/api/encode`）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `transferEncoding` | 当前生效 CTE：`7bit`/`8bit`/`binary`/`base64`/`quoted-printable`，或非标准透传值 |
+| `transferEncodingDeclared` | 解析时头部声明的 CTE；与 `transferEncoding` 相同且未编辑时走字节稳定快速路径 |
+| `decodeState` | `raw`（7/8bit/binary 原样）/ `decoded`（base64、QP 解码成功）/ `malformed`（畸形已尽力恢复）/ `passthrough`（未知 CTE） |
+| `rawBodyBase64` | **未做 CTE 解码的原始传输体**；未编辑节点重新编码时原样回写，保证载荷不丢 |
+| `body` / `bodyEncoding` | CTE 解码后的可编辑内容，及其编辑通道（`utf-8` 文本或 `base64` 二进制通道） |
+| `bodyEdited` | 前端在正文被修改或 CTE 切换时置 `true`；缺省/为假时节点视为未编辑 |
 
 ```json
 {
@@ -273,8 +334,11 @@ python3 tests/smoke_test.py
 
 覆盖：基本 form-data、CJK、嵌套 multipart、preamble/epilogue、
 引号与转义参数、boundary 覆盖、定界符碰撞、缺关闭定界符、LF 规范化、
-二进制逐字节往返、编辑后重新编码，以及样本对比（节点增删折叠、
-字段级差异、头部逐行对比、诊断代码归属与全局诊断）。
+二进制逐字节往返、编辑后重新编码、样本对比（节点增删折叠、
+字段级差异、头部逐行对比、诊断代码归属与全局诊断），以及
+Content-Transfer-Encoding（base64 / quoted-printable / 7bit / 8bit / binary
+的识别、解码、畸形诊断与载荷保留、切换后按 76 字符折行重新编码、
+未编辑节点字节稳定、超长行/裸换行/7bit 约束诊断、diff 检出 CTE 变化）。
 
 ---
 

@@ -45,7 +45,7 @@ const SAMPLE_NESTED =
   'This is a MIME-formatted message.  If you see this, your mailer is broken.\r\n' +
   '--OUTER-001\r\n' +
   'Content-Type: text/plain; charset="utf-8"\r\n' +
-  'Content-Transfer-Encoding: 7bit\r\n' +
+  'Content-Transfer-Encoding: 8bit\r\n' +
   '\r\n' +
   '外层正文：请查收附件。\r\n' +
   '--OUTER-001\r\n' +
@@ -53,16 +53,34 @@ const SAMPLE_NESTED =
   '\r\n' +
   '--INNER-42\r\n' +
   'Content-Type: text/plain; charset=utf-8\r\n' +
+  'Content-Transfer-Encoding: 8bit\r\n' +
   '\r\n' +
   'plain 版本\r\n' +
   '--INNER-42\r\n' +
   'Content-Type: text/html; charset=utf-8\r\n' +
+  'Content-Transfer-Encoding: 8bit\r\n' +
   '\r\n' +
   '<p><b>HTML</b> 版本</p>\r\n' +
   '--INNER-42--\r\n' +
   '--OUTER-001\r\n' +
+  'Content-Type: text/plain; charset="utf-8"\r\n' +
+  'Content-Transfer-Encoding: quoted-printable\r\n' +
+  '\r\n' +
+  '=E6=8A=A5=E4=BB=B7=EF=BC=9ACaf=C3=A9=20=3D=20=C2=A5123.45=EF=BC=8C=E6=95=AC=\r\n' +
+  '=E8=AF=B7=E6=9F=A5=E6=94=B6=E9=99=84=E4=BB=B6=E5=B9=B6=E5=9C=A8=E6=9C=AC=E5=\r\n' +
+  '=91=A8=E5=86=85=E5=9B=9E=E5=A4=8D=E7=A1=AE=E8=AE=A4=EF=BC=8C=E8=B0=A2=E8=B0=\r\n' +
+  '=A2=E5=90=88=E4=BD=9C=EF=BC=81\r\n' +
+  '--=20=E7=BB=93=E5=B0=BE=20--\r\n' +
+  '--OUTER-001\r\n' +
+  'Content-Disposition: attachment; filename="payload.bin"\r\n' +
+  'Content-Type: application/octet-stream\r\n' +
+  'Content-Transfer-Encoding: base64\r\n' +
+  '\r\n' +
+  'TUlNRQABAiBiaW5hcnkg//4gcGF5bG9hZA0KbGluZTINCg==\r\n' +
+  '--OUTER-001\r\n' +
   'Content-Disposition: attachment; filename="report.csv"\r\n' +
-  'Content-Type: text/csv\r\n' +
+  'Content-Type: text/csv; charset=utf-8\r\n' +
+  'Content-Transfer-Encoding: 8bit\r\n' +
   '\r\n' +
   'id,name\r\n' +
   '1,张三\r\n' +
@@ -70,13 +88,18 @@ const SAMPLE_NESTED =
   'epilogue text, must be ignored';
 
 const SAMPLE_BAD =
-  // 故意使用 LF、缺关闭定界符、畸形头部
+  // 故意使用 LF、缺关闭定界符、畸形头部、畸形 base64
   'Content-Type: multipart/form-data; boundary="BROKEN"\n' +
   '\n' +
   '--BROKEN\n' +
   'Content-Disposition: form-data; name="ok"\n' +
   '\n' +
   'good part\n' +
+  '--BROKEN\n' +
+  'Content-Type: application/octet-stream\n' +
+  'Content-Transfer-Encoding: base64\n' +
+  '\n' +
+  'TUlN@@invalid!!!not-enough-padding\n' +
   '--BROKEN\n' +
   'this line is not a valid header (no colon)\n' +
   'Content-Disposition: form-data; name="bad"\n' +
@@ -174,6 +197,31 @@ function reindexPaths(node, path) {
   }
 }
 
+// RFC 2045 Content-Transfer-Encoding 选项
+const CTE_OPTIONS = [
+  ["7bit", "7bit"],
+  ["8bit", "8bit"],
+  ["binary", "binary"],
+  ["base64", "base64"],
+  ["quoted-printable", "quoted-printable"],
+];
+const CTE_SET = new Set(CTE_OPTIONS.map((o) => o[0]));
+const DECODE_STATE_LABEL = {
+  raw: "原始字节（7bit/8bit/binary，未做传输解码）",
+  decoded: "传输解码成功，下方为解码后正文",
+  malformed: "传输解码异常：已尽力恢复，原始载荷保留（未编辑即字节还原）",
+  passthrough: "未知编码：正文按原始字节透传",
+};
+
+function cteStateClass(node) {
+  switch (node.decodeState) {
+    case "decoded": return "cte-ok";
+    case "malformed":
+    case "passthrough": return "cte-warn";
+    default: return "cte-neutral";
+  }
+}
+
 function newPartNode(index) {
   return {
     kind: "part",
@@ -186,6 +234,12 @@ function newPartNode(index) {
     hasHeaders: true,
     body: "",
     bodyEncoding: "utf-8",
+    // 新增节点没有原始传输体，必须走重新编码路径
+    transferEncoding: "7bit",
+    transferEncodingDeclared: "7bit",
+    decodeState: "raw",
+    rawBodyBase64: "",
+    bodyEdited: true,
     rawSize: 0,
   };
 }
@@ -220,9 +274,13 @@ function renderNode(node, depth) {
 
   const bar = document.createElement("div");
   bar.className = "node-bar";
+  const ctePill = isMulti ? "" :
+    `<span class="cte-badge ${cteStateClass(node)}" title="${escapeHtml(DECODE_STATE_LABEL[node.decodeState] || "")}">` +
+    `CTE: ${escapeHtml(node.transferEncoding || "7bit")}${node.bodyEdited ? " ✎" : ""}</span>`;
   bar.innerHTML =
     `<span class="caret">▼</span>` +
     `<span class="badge ${isMulti ? "multipart" : ""}">${escapeHtml(node.mediaType || (isMulti ? "multipart/*" : "application/octet-stream"))}</span>` +
+    ctePill +
     `<span class="node-title">${escapeHtml(node.path)}${titleExtra}</span>` +
     `<span class="node-spacer"></span>` +
     `<span class="node-size">${humanSize(node.rawSize || 0)}</span>`;
@@ -304,23 +362,76 @@ function renderNode(node, depth) {
     childWrap.appendChild(addPart);
     body.appendChild(childWrap);
   } else {
+    // Content-Transfer-Encoding 切换行
+    const cteRow = document.createElement("div");
+    cteRow.className = "inline-row cte-row";
+    cteRow.innerHTML =
+      `<label>Content-Transfer-Encoding</label>` +
+      `<select class="cte-select"></select>` +
+      `<span class="meta-pill ${cteStateClass(node)}">${escapeHtml(DECODE_STATE_LABEL[node.decodeState] || "")}</span>`;
+    const sel = $(".cte-select", cteRow);
+    for (const [val, label] of CTE_OPTIONS) {
+      const opt = document.createElement("option");
+      opt.value = val;
+      opt.textContent = label;
+      sel.appendChild(opt);
+    }
+    // 解析时遇到非标准 CTE（如 x-uuencode）：作为额外选项保留，避免选择丢失
+    const curCte = node.transferEncoding || "7bit";
+    if (!CTE_SET.has(curCte)) {
+      const opt = document.createElement("option");
+      opt.value = curCte;
+      opt.textContent = curCte + "（原样透传）";
+      sel.appendChild(opt);
+    }
+    sel.value = curCte;
+    sel.addEventListener("click", (e) => e.stopPropagation());
+    sel.addEventListener("change", () => {
+      // 切换 base64 / quoted-printable 等：后端按新 CTE 重新编码后下载
+      node.transferEncoding = sel.value;
+      node.bodyEdited = true;
+      rerenderTree();
+    });
+    body.appendChild(cteRow);
+
+    if (node.bodyEdited) {
+      const edited = document.createElement("div");
+      edited.className = "hint cte-edited";
+      edited.textContent = "该节点已被编辑：重新编码时将按所选 CTE 与 MIME 折行规则生成新的传输正文。";
+      body.appendChild(edited);
+    }
+    if (node.decodeState === "malformed" || node.decodeState === "passthrough") {
+      const warn = document.createElement("div");
+      warn.className = "hint cte-malformed";
+      warn.textContent = node.decodeState === "malformed"
+        ? "原始 CTE 编码畸形：上方诊断面板有带节点路径的详情。未编辑时下载仍逐字节还原原始载荷；编辑后按所选 CTE 重新编码。"
+        : "未识别的 CTE：解析时按原始字节透传，未编辑即字节还原。";
+      body.appendChild(warn);
+    }
+
     const lab = document.createElement("label");
     const enc = node.bodyEncoding || "utf-8";
     const isBin = enc === "base64";
-    lab.innerHTML = `正文 <span class="meta-pill ${isBin ? "latin" : ""}">` +
-      `${isBin ? "二进制 · base64（未修改即逐字节还原）" : enc}</span>`;
+    const cteEncoded = curCte === "base64" || curCte === "quoted-printable";
+    lab.innerHTML =
+      (cteEncoded ? "解码后正文（编辑此内容；下载时按所选 CTE 回写）" : "正文") +
+      ` <span class="meta-pill ${isBin ? "latin" : ""}">` +
+      `${isBin ? "编辑器通道 · base64（二进制，未修改即逐字节还原）" : enc}</span>`;
     body.appendChild(lab);
     if (isBin) {
       const note = document.createElement("div");
       note.className = "hint";
-      note.textContent = "该部分不是合法 UTF-8，以 base64 展示。直接编辑会被当作 base64 解码；"
+      note.textContent = "该部分解码后仍不是合法 UTF-8，以 base64 通道展示。直接编辑会被当作 base64 解码；"
         + "若想改为纯文本，请把内容替换为文本即可（将自动按 latin-1 还原字节）。";
       body.appendChild(note);
     }
     const ta = document.createElement("textarea");
     ta.spellcheck = false;
     ta.value = node.body || "";
-    ta.addEventListener("input", () => { node.body = ta.value; });
+    ta.addEventListener("input", () => {
+      node.body = ta.value;
+      node.bodyEdited = true;
+    });
     body.appendChild(ta);
   }
 
@@ -736,12 +847,16 @@ function renderRoNode(node, changeMap) {
   const change = changeMap[node.path];
   if (change && change !== "unchanged") wrap.classList.add("chg-" + change);
   const hasKids = node.kind === "multipart" && (node.parts || []).length > 0;
+  const cteBadge = node.kind === "multipart" ? "" :
+    `<span class="cte-badge ${cteStateClass(node)}" title="${escapeHtml(DECODE_STATE_LABEL[node.decodeState] || "")}">` +
+    `${escapeHtml(node.transferEncoding || "7bit")}</span>`;
   const bar = document.createElement("div");
   bar.className = "ro-bar";
   bar.innerHTML =
     `<span class="caret">${hasKids ? "▼" : "·"}</span>` +
     `<span class="badge ${node.kind === "multipart" ? "multipart" : ""}">` +
     `${escapeHtml(node.mediaType || "?")}</span>` +
+    cteBadge +
     `<span class="node-title">${escapeHtml(node.path || "")}</span>` +
     (change && change !== "unchanged"
       ? `<span class="chg-tag tag-${change}">${CHANGE_LABEL[change]}</span>` : "");

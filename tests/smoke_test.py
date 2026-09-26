@@ -157,6 +157,7 @@ check("碰撞无 error", r6["counts"]["error"] == 0, r6["issues"])
 print("7) 编辑后重新编码")
 r7 = mime.parse_message(raw.decode(), None, None)
 r7["tree"]["parts"][0]["body"] = "bob"
+r7["tree"]["parts"][0]["bodyEdited"] = True
 r7["tree"]["boundary"] = "NEW-B"
 enc7 = mime.encode_tree(r7["tree"], include_headers=True)
 out7 = base64.b64decode(enc7["payloadBase64"])
@@ -303,6 +304,251 @@ check("自比无差异", d6["summary"]["modified"] == 0
       and d6["summary"]["added"] == 0 and d6["summary"]["removed"] == 0,
       d6["summary"])
 check("自比全部 unchanged", d6["summary"]["unchanged"] == len(d6["entries"]))
+
+def _last_part_body(wire, boundary):
+    head = wire.rpartition(b"\r\n--" + boundary)[0]
+    return head.rsplit(b"\r\n\r\n", 1)[1]
+
+
+# 12. Content-Transfer-Encoding：base64 叶子 ---------------------------------
+print("12) base64 CTE 解析/未编辑字节稳定/切换")
+payload = bytes(range(0, 200)) + b"\r\ntail\r\n"
+_b64_wire12 = b"\r\n".join(  # RFC 2045 折行：每行 76 字符
+    base64.b64encode(payload)[i:i + 76]
+    for i in range(0, len(base64.b64encode(payload)), 76))
+raw12 = (
+    b'Content-Type: multipart/mixed; boundary=B64\r\n\r\n'
+    b'--B64\r\n'
+    b'Content-Type: application/octet-stream\r\n'
+    b'Content-Transfer-Encoding: base64\r\n\r\n'
+    + _b64_wire12 + b'\r\n'
+    b'--B64--'
+)
+r12 = mime.parse_message(None, None, None,
+                         raw_base64=base64.b64encode(raw12).decode())
+p12 = r12["tree"]["parts"][0]
+check("识别 CTE base64", p12["transferEncoding"] == "base64", p12)
+check("解码状态 decoded", p12["decodeState"] == "decoded", p12["decodeState"])
+check("声明 CTE 保留", p12["transferEncodingDeclared"] == "base64")
+check("原始传输体保留", base64.b64decode(p12["rawBodyBase64"]) == _b64_wire12,
+      "rawBodyBase64 丢失")
+check("base64 正文解码为原始字节（编辑通道 base64）",
+      base64.b64decode(p12["body"]) == payload, p12["bodyEncoding"])
+check("base64 节点无诊断",
+      not [i for i in r12["issues"] if i["level"] == "warning"],
+      [i["code"] for i in r12["issues"]])
+enc12 = mime.encode_tree(r12["tree"], True)
+out12 = base64.b64decode(enc12["payloadBase64"])
+check("未编辑 base64 节点字节稳定", out12 == raw12,
+      f"\n{out12!r}\n!=\n{raw12!r}")
+
+# 切换到 7bit：按头部声明回写 7bit 原文（二进制内容触发 7bit 约束警告）
+p12["transferEncoding"] = "7bit"
+p12["bodyEdited"] = True
+enc12b = mime.encode_tree(r12["tree"], True)
+out12b = base64.b64decode(enc12b["payloadBase64"])
+check("切换后 CTE 头改写为 7bit", b"Content-Transfer-Encoding: 7bit" in out12b)
+check("7bit 约束诊断", any(i["code"] == "CTE_NOT_7BIT" for i in enc12b["issues"]),
+      [i["code"] for i in enc12b["issues"]])
+
+# 13. Content-Transfer-Encoding：quoted-printable ----------------------------
+print("13) quoted-printable CTE")
+qp_wire = (
+    b'Content-Type: multipart/mixed; boundary=QP\r\n\r\n'
+    b'--QP\r\nContent-Type: text/plain; charset=utf-8\r\n'
+    b'Content-Transfer-Encoding: quoted-printable\r\n\r\n'
+    b'=E4=BD=A0=E5=A5=BD=EF=BC=8CCaf=C3=A9=20=3D=2042\r\n'
+    b'long line =20=3D=20end\r\n'
+    b'--QP--'
+)
+r13 = mime.parse_message(None, None, None,
+                         raw_base64=base64.b64encode(qp_wire).decode())
+p13 = r13["tree"]["parts"][0]
+check("识别 CTE quoted-printable", p13["transferEncoding"] == "quoted-printable")
+check("QP 解码状态 decoded", p13["decodeState"] == "decoded")
+check("QP 正文解码为 UTF-8 文本", p13["body"] == "你好，Café = 42\r\nlong line  = end",
+      repr(p13["body"]))
+enc13 = mime.encode_tree(r13["tree"], True)
+out13 = base64.b64decode(enc13["payloadBase64"])
+check("未编辑 QP 节点字节稳定", out13 == qp_wire,
+      f"\n{out13!r}\n!=\n{qp_wire!r}")
+
+# 编辑文本后切换到 base64：回写 base64 且遵守 76 字符折行
+p13["body"] = "新内容 new body"
+p13["bodyEdited"] = True
+p13["transferEncoding"] = "base64"
+enc13b = mime.encode_tree(r13["tree"], True)
+out13b = base64.b64decode(enc13b["payloadBase64"])
+check("切换后 CTE 头改写为 base64",
+      b"Content-Transfer-Encoding: base64" in out13b)
+body13b = _last_part_body(out13b, b"QP")
+check("base64 正文解码为编辑后字节",
+      base64.b64decode(body13b, validate=False) == "新内容 new body".encode("utf-8"),
+      body13b)
+check("base64 折行不超过 76 字符",
+      all(len(ln) <= 76 for ln in body13b.split(b"\r\n")), body13b)
+
+# 文本切换到 QP：非 ASCII 以 =XX 表示，超长软折行
+p13["transferEncoding"] = "quoted-printable"
+enc13c = mime.encode_tree(r13["tree"], True)
+out13c = base64.b64decode(enc13c["payloadBase64"])
+body13c = _last_part_body(out13c, b"QP")
+check("QP 回写包含 =XX", b"=E6" in body13c, body13c)
+check("QP 折行不超过 76 字符",
+      all(len(ln) <= 76 for ln in body13c.split(b"\r\n")), body13c)
+
+# 14. 畸形 base64 / QP：带路径诊断且不丢失原始载荷 ---------------------------
+print("14) 畸形 CTE 诊断与载荷保留")
+bad_wire = (
+    b'Content-Type: multipart/mixed; boundary=BAD\r\n\r\n'
+    b'--BAD\r\nContent-Transfer-Encoding: base64\r\n\r\n'
+    b'TW@e!!not-base64===\r\n'
+    b'--BAD--'
+)
+r14 = mime.parse_message(None, None, None,
+                         raw_base64=base64.b64encode(bad_wire).decode())
+p14 = r14["tree"]["parts"][0]
+b64_issues = [i for i in r14["issues"] if i["code"] == "BAD_BASE64"]
+check("畸形 base64 产生诊断", bool(b64_issues), [i["code"] for i in r14["issues"]])
+check("畸形诊断带节点路径",
+      any("parts[0]" in i["message"] for i in b64_issues), b64_issues)
+check("解码状态 malformed", p14["decodeState"] == "malformed")
+check("原始载荷未丢失",
+      base64.b64decode(p14["rawBodyBase64"]) == b"TW@e!!not-base64===")
+enc14 = mime.encode_tree(r14["tree"], True)
+out14 = base64.b64decode(enc14["payloadBase64"])
+check("畸形但未编辑：原始字节还原", out14 == bad_wire,
+      f"\n{out14!r}\n!=\n{bad_wire!r}")
+
+bad_qp = (
+    b'Content-Type: multipart/mixed; boundary=BQ\r\n\r\n'
+    b'--BQ\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n'
+    b'ok=ZZbad=4\r\n'
+    b'--BQ--'
+)
+r14b = mime.parse_message(None, None, None,
+                          raw_base64=base64.b64encode(bad_qp).decode())
+qp_issues = [i for i in r14b["issues"] if i["code"] == "BAD_QUOTED_PRINTABLE"]
+check("畸形 QP 产生带路径诊断",
+      bool(qp_issues) and any("parts[0]" in i["message"] for i in qp_issues),
+      [i["code"] for i in r14b["issues"]])
+check("QP 畸形节点状态 malformed",
+      r14b["tree"]["parts"][0]["decodeState"] == "malformed")
+check("QP 畸形载荷保留并尽力解码（非法 =ZZ 与行尾 =4 按字面保留）",
+      r14b["tree"]["parts"][0]["body"] == "ok=ZZbad=4",
+      r14b["tree"]["parts"][0]["body"])
+enc14b = mime.encode_tree(r14b["tree"], True)
+out14b = base64.b64decode(enc14b["payloadBase64"])
+check("畸形 QP 未编辑字节还原", out14b == bad_qp,
+      f"\n{out14b!r}\n!=\n{bad_qp!r}")
+
+# 15. 7bit / 8bit / binary 语义与默认值 --------------------------------------
+print("15) 7bit/8bit/binary 语义")
+raw15 = (
+    b'Content-Type: multipart/mixed; boundary=I7\r\n\r\n'
+    b'--I7\r\nContent-Transfer-Encoding: 8bit\r\n\r\n'
+    + "café 8bit".encode() + b'\r\n'
+    b'--I7\r\nContent-Type: text/plain\r\n\r\n'
+    b'plain 7bit default\r\n'
+    b'--I7\r\nContent-Transfer-Encoding: BINARY\r\n\r\n'
+    + bytes([0, 1, 255]) + b'\r\n'
+    b'--I7--'
+)
+r15 = mime.parse_message(None, None, None,
+                         raw_base64=base64.b64encode(raw15).decode())
+p0, p1, p2 = r15["tree"]["parts"]
+check("8bit CTE 识别", p0["transferEncoding"] == "8bit")
+check("8bit 允许非 ASCII 且无诊断", p0["decodeState"] == "raw" and
+      not [i for i in r15["issues"] if i["code"] == "CTE_NOT_7BIT"])
+check("缺省 CTE 视为 7bit", p1["transferEncoding"] == "7bit"
+      and p1["decodeState"] == "raw", p1.get("transferEncoding"))
+check("BINARY 大小写规范化", p2["transferEncoding"] == "binary")
+check("binary 容忍 NUL", p2["decodeState"] == "raw"
+      and not [i for i in r15["issues"] if i["code"].startswith("CTE_")],
+      [i["code"] for i in r15["issues"]])
+
+# 7bit 声明但含非 ASCII -> 警告
+raw15b = (b'Content-Type: multipart/mixed; boundary=I8\r\n\r\n'
+          b'--I8\r\nContent-Transfer-Encoding: 7bit\r\n\r\n'
+          + "héllo".encode() + b'\r\n--I8--')
+r15b = mime.parse_message(None, None, None,
+                          raw_base64=base64.b64encode(raw15b).decode())
+check("7bit 含非 ASCII 产生 CTE_NOT_7BIT",
+      any(i["code"] == "CTE_NOT_7BIT" for i in r15b["issues"]),
+      [i["code"] for i in r15b["issues"]])
+
+# 未知 CTE -> passthrough，未编辑字节稳定
+raw15c = (b'Content-Type: multipart/mixed; boundary=I9\r\n\r\n'
+          b'--I9\r\nContent-Transfer-Encoding: x-uuencode\r\n\r\n'
+          b'whatever raw\r\n--I9--')
+r15c = mime.parse_message(None, None, None,
+                          raw_base64=base64.b64encode(raw15c).decode())
+p15c = r15c["tree"]["parts"][0]
+check("未知 CTE 标记 passthrough", p15c["decodeState"] == "passthrough"
+      and p15c["transferEncoding"] == "x-uuencode")
+check("未知 CTE 产生诊断",
+      any(i["code"] == "UNKNOWN_TRANSFER_ENCODING" for i in r15c["issues"]))
+enc15c = mime.encode_tree(r15c["tree"], True)
+out15c = base64.b64decode(enc15c["payloadBase64"])
+check("未知 CTE 未编辑字节稳定", out15c == raw15c,
+      f"\n{out15c!r}\n!=\n{raw15c!r}")
+
+# multipart 上声明 base64 -> 警告
+raw15d = (b'Content-Type: multipart/mixed; boundary=M1\r\n\r\n'
+          b'--M1\r\nContent-Type: multipart/mixed; boundary=M2\r\n'
+          b'Content-Transfer-Encoding: base64\r\n\r\n'
+          b'--M2\r\nContent-Type: text/plain\r\n\r\nx\r\n--M2--\r\n--M1--')
+r15d = mime.parse_message(None, None, None,
+                          raw_base64=base64.b64encode(raw15d).decode())
+check("multipart 上声明 base64 报警告",
+      any(i["code"] == "BAD_CTE_ON_MULTIPART" for i in r15d["issues"]),
+      [i["code"] for i in r15d["issues"]])
+
+# 16. base64 折行：超过 76 字符的编码行诊断；长文本重新编码自动折行 -----------
+print("16) base64/QP 折行规则")
+long_payload = bytes(range(256)) * 2
+raw16 = (b'Content-Type: multipart/mixed; boundary=L1\r\n\r\n'
+         b'--L1\r\nContent-Transfer-Encoding: base64\r\n\r\n'
+         + base64.b64encode(long_payload) + b'\r\n--L1--')
+r16 = mime.parse_message(None, None, None,
+                         raw_base64=base64.b64encode(raw16).decode())
+check("超长 base64 行报 CTE_LONG_LINE",
+      any(i["code"] == "CTE_LONG_LINE" for i in r16["issues"]),
+      [i["code"] for i in r16["issues"]])
+p16 = r16["tree"]["parts"][0]
+check("超长行仍可解码", base64.b64decode(p16["body"]) == long_payload)
+# 未编辑：即使畸形（超长行是 warning 而非 malformed）原始字节仍还原
+enc16 = mime.encode_tree(r16["tree"], True)
+out16 = base64.b64decode(enc16["payloadBase64"])
+check("超长行未编辑字节稳定", out16 == raw16)
+# 编辑后重新编码：76 字符折行
+p16["bodyEdited"] = True
+enc16b = mime.encode_tree(r16["tree"], True)
+out16b = base64.b64decode(enc16b["payloadBase64"])
+body16 = _last_part_body(out16b, b"L1")
+check("重新编码后每行 <=76 字符",
+      all(len(ln) <= 76 for ln in body16.split(b"\r\n")),
+      [len(ln) for ln in body16.split(b"\r\n")][:5])
+check("折行 base64 往返字节一致",
+      base64.b64decode(b"".join(body16.split(b"\r\n")), validate=False)
+      == long_payload)
+
+# 17. diff 检出 CTE 变化 ------------------------------------------------------
+print("17) diff 检出 CTE 字段变化")
+s17a = mime.parse_message(
+    (b'Content-Type: multipart/mixed; boundary=D\r\n\r\n'
+     b'--D\r\nContent-Transfer-Encoding: base64\r\n\r\n'
+     + base64.b64encode(b"hello") + b'\r\n--D--').decode(), None, None)
+s17b = mime.parse_message(
+    (b'Content-Type: multipart/mixed; boundary=D\r\n\r\n'
+     b'--D\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n'
+     b'hel=ZZlo\r\n--D--').decode(), None, None)
+d17 = diff.diff_results({"tree": s17a["tree"], "issues": s17a["issues"]},
+                        {"tree": s17b["tree"], "issues": s17b["issues"]})
+fields17 = {f["field"] for e in d17["entries"] if e["path"] == "parts[0]"
+            for f in e.get("fields", [])}
+check("diff 检出 transferEncoding 变化", "transferEncoding" in fields17, fields17)
+check("diff 检出 decodeState 变化", "decodeState" in fields17, fields17)
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

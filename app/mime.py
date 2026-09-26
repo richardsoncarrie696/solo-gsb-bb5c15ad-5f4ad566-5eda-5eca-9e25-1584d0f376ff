@@ -256,6 +256,263 @@ def find_header(headers: list[dict], name: str) -> Optional[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# Content-Transfer-Encoding（RFC 2045 §6）
+# --------------------------------------------------------------------------- #
+
+IDENTITY_TRANSFER_ENCODINGS = {"7bit", "8bit", "binary"}
+KNOWN_TRANSFER_ENCODINGS = IDENTITY_TRANSFER_ENCODINGS | {
+    "base64", "quoted-printable",
+}
+_B64_CHARS = frozenset(
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+_HEX_CHARS = frozenset(b"0123456789abcdefABCDEF")
+# RFC 2045：base64 / quoted-printable 编码行最大 76 字符（不含 CRLF）
+MAX_ENCODED_LINE = 76
+
+
+def parse_transfer_encoding(headers: list[dict], issues: list[dict], path: str):
+    """读取 Content-Transfer-Encoding 头。
+
+    返回 ``(cte, declared)``：缺省头时为 ``("7bit", "7bit")``。
+    按 RFC 2045 该头只能是单个 token、不允许参数；畸形/未知值记录诊断，
+    返回一个 ``x-unknown`` 之类的透传标记，正文按原始字节处理。
+    """
+    h = find_header(headers, "Content-Transfer-Encoding")
+    if h is None:
+        return "7bit", "7bit"
+    value = (h.get("value") or "").strip()
+    m = TOKEN_RE.match(value.encode("ascii", "replace"))
+    token = m.group(0).decode("ascii").lower() if m else ""
+    rest = value[m.end():].strip() if m else value.strip()
+    if not token:
+        _issue(issues, "warning", "BAD_CTE_SYNTAX",
+               f"{path}：Content-Transfer-Encoding 值 {value!r} 不是合法 token，"
+               "已按未知编码原样透传（原始载荷保留）")
+        return "x-unknown", "x-unknown"
+    if rest:
+        _issue(issues, "warning", "BAD_CTE_SYNTAX",
+               f"{path}：Content-Transfer-Encoding 只允许单个 token，"
+               f"已忽略多余内容 {rest!r}")
+    if token not in KNOWN_TRANSFER_ENCODINGS:
+        _issue(issues, "warning", "UNKNOWN_TRANSFER_ENCODING",
+               f"{path}：不支持的 Content-Transfer-Encoding {token!r}，"
+               "正文按原始字节透传，不做解码/重新编码")
+    return token, token
+
+
+def _check_identity_cte(data: bytes, cte: str, issues: list[dict], path: str):
+    """校验 7bit/8bit 正文约束；binary 不做任何限制。"""
+    if cte not in IDENTITY_TRANSFER_ENCODINGS:
+        return
+    has_ctl = any(b < 0x20 and b not in (0x09, 0x0A, 0x0D) for b in data)
+    if cte == "7bit":
+        if any(b > 127 for b in data):
+            _issue(issues, "warning", "CTE_NOT_7BIT",
+                   f"{path}：声明为 7bit 但正文含非 ASCII 字节（>0x7F），"
+                   "严格实现可能拒绝；可切换为 base64 或 quoted-printable")
+        elif has_ctl:
+            _issue(issues, "warning", "CTE_NOT_7BIT",
+                   f"{path}：声明为 7bit 但正文含 NUL 等 C0 控制字节，"
+                   "不满足 RFC 2045 的 7bit 规则；可切换为 binary/base64")
+    elif cte == "8bit" and has_ctl:
+        _issue(issues, "warning", "CTE_BINARY_IN_8BIT",
+               f"{path}：声明为 8bit 但正文含 NUL 等 C0 控制字节（更接近 binary）")
+    if cte in ("7bit", "8bit"):
+        for i, b in enumerate(data):
+            bare = (b == 0x0A and (i == 0 or data[i - 1] != 0x0D)) or \
+                   (b == 0x0D and (i + 1 >= len(data) or data[i + 1] != 0x0A))
+            if bare:
+                _issue(issues, "warning", "CTE_BARE_NEWLINE",
+                       f"{path}：声明为 {cte} 的正文含孤立 CR/LF；"
+                       "RFC 2045 要求行结束为 CRLF")
+                break
+
+
+def _decode_base64_wire(data: bytes, issues: list[dict], path: str):
+    """宽容解码 base64 传输正文，返回 ``(decoded, malformed)``。
+
+    剔除非法空白/字符、容错 padding；任何畸形都产生带节点路径的诊断。
+    原始传输字节由调用方保留在 rawBodyBase64，未编辑即逐字节还原。
+    """
+    start = len(issues)
+    illegal = sorted({b for b in data
+                      if b not in _B64_CHARS and b not in (0x20, 0x09, 0x0D, 0x0A)})
+    if illegal:
+        preview = " ".join(f"0x{b:02X}" for b in illegal[:8])
+        _issue(issues, "warning", "BAD_BASE64",
+               f"{path}：base64 正文含非法字符（{preview}），已剔除后尽力解码；"
+               "原始传输字节保留在该节点，未编辑即逐字节还原")
+    for line_no, line in enumerate(data.split(CRLF), 1):
+        token = line.strip(b" \t")
+        if len(token) > MAX_ENCODED_LINE:
+            _issue(issues, "warning", "CTE_LONG_LINE",
+                   f"{path}：base64 第 {line_no} 行 {len(token)} 字符，"
+                   f"超过 RFC 2045 的 {MAX_ENCODED_LINE} 字符折行限制")
+            break
+    cleaned = bytes(b for b in data if b in _B64_CHARS)
+    core = cleaned.rstrip(b"=")
+    pad = len(cleaned) - len(core)
+    if b"=" in core:
+        _issue(issues, "warning", "BAD_BASE64",
+               f"{path}：base64 的 '=' 只允许出现在末尾填充位，已尽力解码")
+    if pad > 2:
+        _issue(issues, "warning", "BAD_BASE64",
+               f"{path}：base64 填充位 '=' 最多 2 个（发现 {pad} 个），已尽力解码")
+    decoded: Optional[bytes] = None
+    try:
+        decoded = base64.b64decode(cleaned, validate=True)
+    except (binascii.Error, ValueError):
+        padded = core + b"=" * (-len(core) % 4)
+        try:
+            decoded = base64.b64decode(padded, validate=True)
+            _issue(issues, "warning", "BAD_BASE64",
+                   f"{path}：base64 缺少/错误 padding，已补齐后解码")
+        except (binascii.Error, ValueError):
+            try:
+                decoded = base64.b64decode(cleaned, validate=False)
+            except (binascii.Error, ValueError):
+                decoded = data.strip(b" \t\r\n")
+            _issue(issues, "warning", "BAD_BASE64",
+                   f"{path}：base64 数据无法完整解码，已保留可恢复部分；"
+                   "原始传输字节未丢失")
+    malformed = any(it["code"] == "BAD_BASE64" for it in issues[start:])
+    return decoded, malformed
+
+
+def _decode_quoted_printable_wire(data: bytes, issues: list[dict], path: str):
+    """宽容解码 quoted-printable（RFC 2045 §6.7），返回 ``(decoded, malformed)``。"""
+    start = len(issues)
+    out = bytearray()
+    n = len(data)
+    pos = 0
+    line_no = 0
+    bare_reported = False
+    long_reported = False
+
+    while True:
+        line_no += 1
+        nl = data.find(b"\n", pos)
+        segment = data[pos:nl] if nl >= 0 else data[pos:n]
+        if segment.endswith(b"\r"):
+            segment = segment[:-1]
+        elif nl >= 0 and not bare_reported:
+            _issue(issues, "warning", "CTE_BARE_NEWLINE",
+                   f"{path}：quoted-printable 正文含孤立 LF；"
+                   "RFC 2045 要求 CRLF，已按 CRLF 解释")
+            bare_reported = True
+        if b"\r" in segment:
+            segment = segment.replace(b"\r", b"")
+            if not bare_reported:
+                _issue(issues, "warning", "CTE_BARE_NEWLINE",
+                       f"{path}：quoted-printable 正文含孤立 CR；已按 CRLF 解释")
+                bare_reported = True
+        if len(segment) > MAX_ENCODED_LINE and not long_reported:
+            _issue(issues, "warning", "CTE_LONG_LINE",
+                   f"{path}：quoted-printable 第 {line_no} 行 {len(segment)} 字符，"
+                   f"超过 RFC 2045 的 {MAX_ENCODED_LINE} 字符折行限制")
+            long_reported = True
+        soft_break = segment.endswith(b"=")
+        if soft_break:
+            segment = segment[:-1]
+        if (not soft_break and segment and segment[-1] in (0x20, 0x09)):
+            _issue(issues, "warning", "CTE_TRAILING_WSP",
+                   f"{path}：quoted-printable 硬换行前的空格/制表符应编码为 =20/=09，"
+                   "严格解码时可能丢失")
+        i = 0
+        while i < len(segment):
+            b = segment[i]
+            if b == 0x3D:
+                hx = segment[i + 1:i + 3]
+                # 行尾的 '=4'：第三个十六进制字符落在软折行之外，
+                # 按 RFC 2045 属畸形转义；'=' 与已取到的字符按字面保留
+                if len(hx) == 2 and all(c in _HEX_CHARS for c in hx):
+                    out.append(int(hx, 16))
+                    i += 3
+                    continue
+                _issue(issues, "warning", "BAD_QUOTED_PRINTABLE",
+                       f"{path}：quoted-printable 非法转义 "
+                       f"{bytes(segment[i:i + 3])!r}，已按字面保留；"
+                       "原始传输字节未丢失")
+                out += segment[i:i + 1 + len(hx)]
+                i += 1 + len(hx)
+                continue
+            out.append(b)
+            i += 1
+        if nl < 0:
+            break
+        pos = nl + 1
+        if not soft_break:
+            out += CRLF
+    malformed = any(it["code"] == "BAD_QUOTED_PRINTABLE" for it in issues[start:])
+    return bytes(out), malformed
+
+
+def decode_transfer_body(headers: list[dict], body: bytes,
+                         issues: list[dict], path: str) -> dict:
+    """叶子部分：按声明的 CTE 解码传输正文，再转换为可编辑表示。
+
+    返回字段：
+      body / bodyEncoding        解码后内容的编辑器表示（utf-8 或 base64 通道）；
+      transferEncoding           头部声明的 CTE（规范化小写，缺省 7bit）；
+      transferEncodingDeclared   解析时声明的 CTE（未编辑快速路径判据）；
+      decodeState                raw / decoded / malformed / passthrough；
+      rawBodyBase64              未做 CTE 解码的原始传输体（保证载荷不丢、
+                                 未编辑节点字节稳定）。
+    """
+    cte, _declared = parse_transfer_encoding(headers, issues, path)
+    state = "raw"
+    if cte in IDENTITY_TRANSFER_ENCODINGS:
+        _check_identity_cte(body, cte, issues, path)
+        decoded = body
+    elif cte == "base64":
+        decoded, malformed = _decode_base64_wire(body, issues, path)
+        state = "malformed" if malformed else "decoded"
+    elif cte == "quoted-printable":
+        decoded, malformed = _decode_quoted_printable_wire(body, issues, path)
+        state = "malformed" if malformed else "decoded"
+    else:
+        decoded = body
+        state = "passthrough"
+
+    text, edit_enc, bin_warn = _decode_body_for_edit(decoded)
+    if bin_warn:
+        _issue(issues, "info", "BINARY_BODY", f"{path}：{bin_warn}")
+    return {
+        "body": text,
+        "bodyEncoding": edit_enc,
+        "transferEncoding": cte,
+        "transferEncodingDeclared": cte,
+        "decodeState": state,
+        "rawBodyBase64": base64.b64encode(body).decode("ascii"),
+    }
+
+
+def _leaf_node_fields(headers: list[dict], body: bytes,
+                      issues: list[dict], path: str) -> dict:
+    """叶子节点的 CTE 解码结果 + Content-Disposition 的 name/filename。"""
+    fields = decode_transfer_body(headers, body, issues, path)
+    cd = find_header(headers, "Content-Disposition")
+    name = None
+    filename = None
+    if cd is not None:
+        cd_params = _parse_secondary_params(cd["value"])
+        name = cd_params.get("name")
+        filename = cd_params.get("filename")
+    fields["name"] = name
+    fields["filename"] = filename
+    return fields
+
+
+def _check_multipart_cte(headers: list[dict], issues: list[dict], path: str):
+    """RFC 2045：multipart 实体只能使用 7bit/8bit/binary。"""
+    cte, _ = parse_transfer_encoding(headers, issues, path)
+    if cte not in IDENTITY_TRANSFER_ENCODINGS:
+        _issue(issues, "warning", "BAD_CTE_ON_MULTIPART",
+               f"{path}：multipart 实体声明了 Content-Transfer-Encoding: {cte}，"
+               "RFC 2045 要求 multipart 只能使用 7bit/8bit/binary；已忽略该编码")
+
+
+# --------------------------------------------------------------------------- #
 # multipart 切分（RFC 2046 §5.1.1）
 # --------------------------------------------------------------------------- #
 
@@ -452,6 +709,7 @@ def _build_part(raw: bytes, issues: list[dict], path: str) -> dict:
                    f"{path}：{media_type} 缺少 boundary 参数，无法切分子部分")
 
     if is_multipart and boundary is not None:
+        _check_multipart_cte(headers, issues, path)
         sp = split_multipart(body, boundary, issues, path=path)
         children = []
         for idx, p in enumerate(sp["parts"]):
@@ -477,28 +735,15 @@ def _build_part(raw: bytes, issues: list[dict], path: str) -> dict:
             "rawSize": len(raw),
         }
 
-    body_text, enc, warn = _decode_body_for_edit(body)
-    if warn:
-        _issue(issues, "info", "BINARY_BODY", f"{path}：{warn}")
-    cd = find_header(headers, "Content-Disposition")
-    name = None
-    filename = None
-    if cd is not None:
-        _, cd_params = parse_content_type("x/x; " + cd["value"], [], context="x") \
-            if False else (None, _parse_secondary_params(cd["value"]))
-        name = cd_params.get("name")
-        filename = cd_params.get("filename")
+    leaf = _leaf_node_fields(headers, body, issues, path)
     return {
         "kind": "part",
         "path": path,
         "mediaType": media_type or "application/octet-stream",
         "headers": headers,
         "hasHeaders": has_headers,
-        "body": body_text,
-        "bodyEncoding": enc,
-        "name": name,
-        "filename": filename,
         "rawSize": len(raw),
+        **leaf,
     }
 
 
@@ -665,6 +910,7 @@ def parse_message(raw_text: Optional[str], content_type_input: Optional[str],
         if not BOUNDARY_BCHARS_RE.fullmatch(effective_boundary):
             _issue(issues, "warning", "BOUNDARY_NONCOMPLIANT",
                    "生效的 boundary 超过 70 字符或含不允许的字符")
+        _check_multipart_cte(top_headers, issues, "root")
         sp = split_multipart(body, effective_boundary, issues, path="root")
         children = [
             _build_part(p, issues, f"parts[{idx}]")
@@ -696,18 +942,15 @@ def parse_message(raw_text: Optional[str], content_type_input: Optional[str],
         if media_type and media_type.startswith("multipart/") and effective_boundary is None:
             _issue(issues, "error", "MISSING_BOUNDARY",
                    "multipart 报文缺少 boundary 参数，无法切分")
-        body_text, enc, warn = _decode_body_for_edit(body)
-        if warn:
-            _issue(issues, "info", "BINARY_BODY", f"root：{warn}")
+        leaf = _leaf_node_fields(top_headers, body, issues, "root")
         tree = {
             "kind": "part",
             "path": "root",
             "mediaType": media_type or "application/octet-stream",
             "headers": top_headers,
             "hasHeaders": bool(has_top_headers),
-            "body": body_text,
-            "bodyEncoding": enc,
             "rawSize": len(data),
+            **leaf,
         }
 
     counts = {"error": 0, "warning": 0, "info": 0}
@@ -742,6 +985,89 @@ def _encode_text(s, encoding: str) -> bytes:
             # 用户改动后可能不再是合法 base64，退回逐字节编码
             return s.encode("latin-1", errors="replace")
     return s.encode("utf-8", errors="replace")
+
+
+def _encode_base64_wire(data: bytes) -> bytes:
+    """RFC 2045 §6.8：base64，每行 76 字符，CRLF 折行（末行不带多余 CRLF）。"""
+    if not data:
+        return b""
+    encoded = base64.b64encode(data)
+    lines = [encoded[i:i + MAX_ENCODED_LINE]
+             for i in range(0, len(encoded), MAX_ENCODED_LINE)]
+    return CRLF.join(lines)
+
+
+def _encode_quoted_printable_wire(data: bytes) -> bytes:
+    """RFC 2045 §6.7 quoted-printable 编码：
+
+    * 可打印 ASCII（除 '='）原样输出；
+    * '='、非 ASCII 与 C0 控制字节编码为 =XX；
+    * 编码行不超过 76 字符，超长以 '=' 软折行（CRLF）；
+    * 硬换行前（及数据末尾）的空格/制表符也编码为 =20/=09；
+    * 原始 CRLF 保留为硬换行，孤立 CR/LF 编码（不生成裸换行）。
+    """
+    # 1) 先切分 token：普通可打印字节、=XX 转义、CRLF 硬换行标记
+    tokens: list = []
+    i, n = 0, len(data)
+    while i < n:
+        b = data[i]
+        if b == 0x0D and i + 1 < n and data[i + 1] == 0x0A:
+            tokens.append(("nl", CRLF))
+            i += 2
+            continue
+        if 33 <= b <= 126 and b != 0x3D:
+            tokens.append(("ch", bytes([b])))
+        elif b in (0x20, 0x09):
+            # 后随硬换行或位于数据末尾的 WSP 必须编码（RFC 2045 rule 3）
+            if i + 1 >= n:
+                follows_nl = False
+                at_end = True
+            else:
+                at_end = False
+                follows_nl = (data[i + 1] == 0x0A or
+                              (data[i + 1] == 0x0D and
+                               (i + 2 >= n or data[i + 2] == 0x0A)))
+            tokens.append(("ch", b"=%02X" % b) if (at_end or follows_nl)
+                          else ("ch", bytes([b])))
+        else:
+            tokens.append(("ch", b"=%02X" % b))
+        i += 1
+
+    # 2) 组装逻辑行，超过 75 字符就先补 '=' 软折行
+    out_lines: list[bytes] = []
+    line = bytearray()
+    for kind, tok in tokens:
+        if kind == "nl":
+            out_lines.append(bytes(line))
+            line = bytearray()
+            continue
+        if line and len(line) + len(tok) > 75:
+            line.append(0x3D)
+            out_lines.append(bytes(line))
+            line = bytearray()
+        line += tok
+    out_lines.append(bytes(line))
+    return CRLF.join(out_lines)
+
+
+def _sync_cte_header(headers: list[dict], cte: str, issues: list[dict], path: str):
+    """让 Content-Transfer-Encoding 头部与节点选择的 CTE 保持一致。
+
+    已有头部时就地改值（7bit/8bit/binary 也同步，保证选择生效）；
+    没有头部且 CTE 为非透传编码（base64 / quoted-printable / 未知）时新增，
+    默认的 7bit 不凭空添加头部。
+    """
+    h = find_header(headers, "Content-Transfer-Encoding")
+    if h is not None:
+        if (h.get("value") or "").strip().lower() != cte:
+            h["value"] = cte
+            h["name"] = "Content-Transfer-Encoding"
+        return
+    if cte not in IDENTITY_TRANSFER_ENCODINGS:
+        headers.append({"name": "Content-Transfer-Encoding",
+                        "value": cte, "raw": ""})
+        _issue(issues, "info", "CTE_HEADER_ADDED",
+               f"{path}：已添加 Content-Transfer-Encoding: {cte} 头部")
 
 
 def _sync_boundary_header(headers: list[dict], media_type: str, boundary: str,
@@ -802,6 +1128,23 @@ def _build_head(headers: list[dict]) -> bytes:
         head += name.encode("ascii", "replace") + b": " + \
                 (h.get("value") or "").encode("utf-8", "replace") + CRLF
     return bytes(head)
+
+
+def _encode_leaf_body(node: dict, cte: str, issues: list[dict], path: str) -> bytes:
+    """把编辑器中的“已解码正文”按所选 CTE 编码回传输字节。"""
+    decoded = _encode_text(node.get("body", ""),
+                           node.get("bodyEncoding", "utf-8"))
+    if cte == "base64":
+        return _encode_base64_wire(decoded)
+    if cte == "quoted-printable":
+        return _encode_quoted_printable_wire(decoded)
+    if cte in IDENTITY_TRANSFER_ENCODINGS:
+        _check_identity_cte(decoded, cte, issues, path)
+        return decoded
+    # 未知 / 非标准 CTE：原样透传编辑器字节
+    _issue(issues, "warning", "UNKNOWN_TRANSFER_ENCODING",
+           f"{path}：未知的 Content-Transfer-Encoding {cte!r}，正文按原始字节透传")
+    return decoded
 
 
 def _assemble_node(node: dict, issues: list[dict], path: str):
@@ -871,12 +1214,24 @@ def _assemble_node(node: dict, issues: list[dict], path: str):
 
     # hasHeaders=False 的部分原本就没有头部块（也没有头/体空行），
     # 必须逐字节保留；用户一旦添加头部则恢复标准 head+CRLF+body 结构。
+    cte = (node.get("transferEncoding") or "7bit").strip().lower() or "7bit"
+    declared = (node.get("transferEncodingDeclared") or cte).strip().lower()
     if node.get("hasHeaders") is False and not headers:
-        body = _encode_text(node.get("body", ""),
-                            node.get("bodyEncoding", "utf-8"))
-        return b"", body
+        # 未编辑的无头部部分：直接回写解析时保留的原始传输体
+        raw_b64 = node.get("rawBodyBase64")
+        if not node.get("bodyEdited") and raw_b64:
+            return b"", base64.b64decode(raw_b64)
+        return b"", _encode_leaf_body(node, cte, issues, path)
+
+    # 未编辑节点字节稳定：CTE 未切换且正文未改动时回写原始传输字节
+    raw_b64 = node.get("rawBodyBase64")
+    unedited = (not node.get("bodyEdited")) and raw_b64 and cte == declared
+    if unedited:
+        body = base64.b64decode(raw_b64)
+    else:
+        body = _encode_leaf_body(node, cte, issues, path)
+    _sync_cte_header(headers, cte, issues, path)
     head = _build_head(headers)
-    body = _encode_text(node.get("body", ""), node.get("bodyEncoding", "utf-8"))
     return head, body
 
 
